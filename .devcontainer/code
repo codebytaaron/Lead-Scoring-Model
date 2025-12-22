@@ -1,0 +1,17 @@
+lead-scoring-model/
+  README.md
+  requirements.txt
+  .gitignore
+  sample_leads.csv
+  config.yaml
+  run.py
+  lead_scoring/
+    __init__.py
+    config.py
+    normalize.py
+    rules.py
+    scorer.py
+    explain.py
+    io.py
+  tests/
+    test_scorer.py
