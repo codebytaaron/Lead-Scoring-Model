@@ -35,3 +35,35 @@ Inputs are flexible and can be adapted to different businesses and pipelines.
 
 ## How It Works (High Level)
 
+The system is designed to stay simple, explainable, and easy to integrate into existing workflows.
+
+---
+
+## Design Goals
+
+- Clear and explainable scoring logic  
+- Handles messy, real-world data  
+- Easy to customize and extend  
+- Built for practical sales and marketing use  
+
+---
+
+## Tech (High Level)
+
+- Python  
+- Data processing logic  
+- Rule-based and weighted scoring  
+
+---
+
+## Access
+
+The full model and scoring logic are not public.
+
+If you want:
+- A demo  
+- A walkthrough  
+- Access to the implementation  
+
+Reach out to discuss.
+
