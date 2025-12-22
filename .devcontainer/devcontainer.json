@@ -1,0 +1,279 @@
+{
+  "image": "mcr.microsoft.com/devcontainers/universal:2",
+  "features": {}
+}
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Any, Optional
+import math
+
+import pandas as pd
+import numpy as np
+
+
+# ---------------------------
+# Config
+# ---------------------------
+
+@dataclass(frozen=True)
+class ScoreConfig:
+    """
+    Public template configuration.
+    Replace these weights/rules with your private version if needed.
+    """
+    max_score: int = 100
+
+    # Weight buckets (sum doesn't have to be 1, we normalize)
+    w_profile: float = 0.35
+    w_engagement: float = 0.45
+    w_source: float = 0.20
+
+    # Qualification thresholds
+    high_threshold: int = 75
+    medium_threshold: int = 50
+
+    # Engagement caps
+    max_site_visits: int = 30
+    max_email_opens: int = 15
+    max_email_clicks: int = 10
+
+    # Source quality mapping (editable)
+    source_scores: Dict[str, int] = None
+
+    def __post_init__(self):
+        if self.source_scores is None:
+            object.__setattr__(
+                self,
+                "source_scores",
+                {
+                    "referral": 90,
+                    "inbound": 80,
+                    "organic": 70,
+                    "paid_search": 60,
+                    "paid_social": 55,
+                    "cold_outreach": 45,
+                    "unknown": 50,
+                },
+            )
+
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if pd.isna(x):
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+
+def safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def normalize_weighted(parts: List[Tuple[float, float]]) -> float:
+    """
+    parts: list of (value_0_to_1, weight)
+    returns normalized weighted average in [0, 1]
+    """
+    total_w = sum(w for _, w in parts)
+    if total_w <= 0:
+        return 0.0
+    return sum(v * w for v, w in parts) / total_w
+
+
+# ---------------------------
+# Feature scoring (0..1)
+# ---------------------------
+
+def score_profile(lead: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
+    """
+    Example profile scoring:
+    - company_size: prefer mid-market and above
+    - title_seniority: decision-maker bias
+    - industry_match: boolean-ish
+    """
+    company_size = safe_int(lead.get("company_size"), 0)
+    title = str(lead.get("title") or "").lower()
+    industry_match = bool(lead.get("industry_match", False))
+
+    # Company size score
+    # 0-10 very small -> low
+    # 11-50 small -> medium
+    # 51-250 mid -> high
+    # 251+ enterprise -> high
+    if company_size <= 10:
+        s_company = 0.25
+    elif company_size <= 50:
+        s_company = 0.55
+    elif company_size <= 250:
+        s_company = 0.85
+    else:
+        s_company = 0.90
+
+    # Seniority heuristic
+    senior_keywords = ["founder", "owner", "ceo", "cto", "cfo", "vp", "head", "director"]
+    mid_keywords = ["manager", "lead"]
+    if any(k in title for k in senior_keywords):
+        s_title = 0.90
+    elif any(k in title for k in mid_keywords):
+        s_title = 0.70
+    elif title.strip():
+        s_title = 0.45
+    else:
+        s_title = 0.35
+
+    s_industry = 0.85 if industry_match else 0.50
+
+    parts = [
+        (s_company, 0.45),
+        (s_title, 0.35),
+        (s_industry, 0.20),
+    ]
+    score = normalize_weighted(parts)
+
+    signals = {
+        "company_size_fit": s_company,
+        "title_seniority": s_title,
+        "industry_match": s_industry,
+    }
+    return score, signals
+
+
+def score_engagement(lead: Dict[str, Any], cfg: ScoreConfig) -> Tuple[float, Dict[str, float]]:
+    """
+    Example engagement scoring:
+    - site_visits
+    - email_opens
+    - email_clicks
+    - requested_demo (strong signal)
+    """
+    visits = safe_int(lead.get("site_visits"), 0)
+    opens = safe_int(lead.get("email_opens"), 0)
+    clicks = safe_int(lead.get("email_clicks"), 0)
+    requested_demo = bool(lead.get("requested_demo", False))
+
+    s_visits = clamp(visits / max(cfg.max_site_visits, 1), 0.0, 1.0)
+    s_opens = clamp(opens / max(cfg.max_email_opens, 1), 0.0, 1.0)
+    s_clicks = clamp(clicks / max(cfg.max_email_clicks, 1), 0.0, 1.0)
+    s_demo = 1.0 if requested_demo else 0.0
+
+    parts = [
+        (s_visits, 0.25),
+        (s_opens, 0.15),
+        (s_clicks, 0.30),
+        (s_demo, 0.30),
+    ]
+    score = normalize_weighted(parts)
+
+    signals = {
+        "site_visits": s_visits,
+        "email_opens": s_opens,
+        "email_clicks": s_clicks,
+        "requested_demo": s_demo,
+    }
+    return score, signals
+
+
+def score_source(lead: Dict[str, Any], cfg: ScoreConfig) -> Tuple[float, Dict[str, float]]:
+    """
+    Source score based on a mapping. Returns 0..1
+    """
+    source = str(lead.get("source") or "unknown").lower().strip()
+    raw = cfg.source_scores.get(source, cfg.source_scores.get("unknown", 50))
+    s_source = clamp(raw / 100.0, 0.0, 1.0)
+
+    return s_source, {"source_quality": s_source}
+
+
+# ---------------------------
+# Main scoring
+# ---------------------------
+
+def score_lead(lead: Dict[str, Any], cfg: Optional[ScoreConfig] = None) -> Dict[str, Any]:
+    cfg = cfg or ScoreConfig()
+
+    s_profile, sig_profile = score_profile(lead)
+    s_eng, sig_eng = score_engagement(lead, cfg)
+    s_source, sig_source = score_source(lead, cfg)
+
+    combined_0_1 = normalize_weighted([
+        (s_profile, cfg.w_profile),
+        (s_eng, cfg.w_engagement),
+        (s_source, cfg.w_source),
+    ])
+
+    score_0_100 = int(round(clamp(combined_0_1, 0.0, 1.0) * cfg.max_score))
+
+    if score_0_100 >= cfg.high_threshold:
+        qual = "high"
+    elif score_0_100 >= cfg.medium_threshold:
+        qual = "medium"
+    else:
+        qual = "low"
+
+    # Build an explainable list of top signals
+    all_signals = {}
+    all_signals.update(sig_profile)
+    all_signals.update(sig_eng)
+    all_signals.update(sig_source)
+
+    # Top 5 signals by contribution proxy (value)
+    top_signals = sorted(all_signals.items(), key=lambda kv: kv[1], reverse=True)[:5]
+
+    return {
+        "lead_id": lead.get("lead_id"),
+        "score": score_0_100,
+        "qualification": qual,
+        "top_signals": [{"signal": k, "value_0_to_1": round(v, 3)} for k, v in top_signals],
+        "debug": {
+            "profile": round(s_profile, 3),
+            "engagement": round(s_eng, 3),
+            "source": round(s_source, 3),
+        },
+    }
+
+
+def score_csv(input_csv: str, output_csv: str, cfg: Optional[ScoreConfig] = None) -> None:
+    cfg = cfg or ScoreConfig()
+    df = pd.read_csv(input_csv)
+
+    results: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        results.append(score_lead(row.to_dict(), cfg))
+
+    out = pd.DataFrame(results)
+    out.to_csv(output_csv, index=False)
+
+
+# ---------------------------
+# CLI
+# ---------------------------
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Template Lead Scoring Model (public version).")
+    parser.add_argument("--in", dest="inp", required=True, help="Input CSV path")
+    parser.add_argument("--out", dest="out", required=True, help="Output CSV path")
+    args = parser.parse_args()
+
+    score_csv(args.inp, args.out)
+    print(f"Scored leads saved to: {args.out}")
+
+
+if __name__ == "__main__":
+    main()
