@@ -1,0 +1,257 @@
+pandas>=2.0.0
+numpy>=1.24.0
+pydantic>=2.0.0
+pyyaml>=6.0.0
+max_score: 100
+
+thresholds:
+  high: 75
+  medium: 50
+
+weights:
+  profile: 0.35
+  engagement: 0.45
+  source: 0.20
+
+caps:
+  site_visits: 30
+  email_opens: 15
+  email_clicks: 10
+
+source_scores:
+  referral: 90
+  inbound: 80
+  organic: 70
+  paid_search: 60
+  paid_social: 55
+  cold_outreach: 45
+  unknown: 50
+from __future__ import annotations
+from typing import Dict
+from pydantic import BaseModel, Field
+import yaml
+
+
+class Thresholds(BaseModel):
+    high: int = 75
+    medium: int = 50
+
+
+class Weights(BaseModel):
+    profile: float = 0.35
+    engagement: float = 0.45
+    source: float = 0.20
+
+
+class Caps(BaseModel):
+    site_visits: int = 30
+    email_opens: int = 15
+    email_clicks: int = 10
+
+
+class ModelConfig(BaseModel):
+    max_score: int = 100
+    thresholds: Thresholds = Field(default_factory=Thresholds)
+    weights: Weights = Field(default_factory=Weights)
+    caps: Caps = Field(default_factory=Caps)
+    source_scores: Dict[str, int] = Field(default_factory=lambda: {
+        "referral": 90,
+        "inbound": 80,
+        "organic": 70,
+        "paid_search": 60,
+        "paid_social": 55,
+        "cold_outreach": 45,
+        "unknown": 50,
+    })
+
+
+def load_config(path: str) -> ModelConfig:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    return ModelConfig(**raw)
+from __future__ import annotations
+from typing import Any
+import pandas as pd
+
+
+def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, x))
+
+
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if pd.isna(x):
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+
+def safe_bool(x: Any, default: bool = False) -> bool:
+    if x is None:
+        return default
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    if s in {"1", "true", "t", "yes", "y"}:
+        return True
+    if s in {"0", "false", "f", "no", "n"}:
+        return False
+    return default
+
+
+def safe_str(x: Any, default: str = "") -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return default
+    return str(x)
+from __future__ import annotations
+from typing import Dict, Any, Tuple
+from .normalize import clamp, safe_int, safe_bool, safe_str
+from .config import ModelConfig
+
+
+def profile_score(lead: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
+    company_size = safe_int(lead.get("company_size"), 0)
+    title = safe_str(lead.get("title")).lower()
+    industry_match = safe_bool(lead.get("industry_match"), False)
+
+    # Company size heuristic
+    if company_size <= 10:
+        s_company = 0.25
+    elif company_size <= 50:
+        s_company = 0.55
+    elif company_size <= 250:
+        s_company = 0.85
+    else:
+        s_company = 0.90
+
+    # Seniority heuristic
+    senior = ["founder", "owner", "ceo", "cto", "cfo", "vp", "head", "director"]
+    mid = ["manager", "lead"]
+    if any(k in title for k in senior):
+        s_title = 0.90
+    elif any(k in title for k in mid):
+        s_title = 0.70
+    elif title.strip():
+        s_title = 0.45
+    else:
+        s_title = 0.35
+
+    s_industry = 0.85 if industry_match else 0.50
+
+    # Weighted within profile bucket
+    score = (0.45 * s_company + 0.35 * s_title + 0.20 * s_industry)
+    score = clamp(score)
+
+    signals = {
+        "company_size_fit": s_company,
+        "title_seniority": s_title,
+        "industry_match": s_industry,
+    }
+    return score, signals
+
+
+def engagement_score(lead: Dict[str, Any], cfg: ModelConfig) -> Tuple[float, Dict[str, float]]:
+    visits = safe_int(lead.get("site_visits"), 0)
+    opens = safe_int(lead.get("email_opens"), 0)
+    clicks = safe_int(lead.get("email_clicks"), 0)
+    requested_demo = safe_bool(lead.get("requested_demo"), False)
+
+    s_visits = clamp(visits / max(cfg.caps.site_visits, 1))
+    s_opens = clamp(opens / max(cfg.caps.email_opens, 1))
+    s_clicks = clamp(clicks / max(cfg.caps.email_clicks, 1))
+    s_demo = 1.0 if requested_demo else 0.0
+
+    score = (0.25 * s_visits + 0.15 * s_opens + 0.30 * s_clicks + 0.30 * s_demo)
+    score = clamp(score)
+
+    signals = {
+        "site_visits": s_visits,
+        "email_opens": s_opens,
+        "email_clicks": s_clicks,
+        "requested_demo": s_demo,
+    }
+    return score, signals
+
+
+def source_score(lead: Dict[str, Any], cfg: ModelConfig) -> Tuple[float, Dict[str, float]]:
+    source = safe_str(lead.get("source"), "unknown").strip().lower()
+    raw = cfg.source_scores.get(source, cfg.source_scores.get("unknown", 50))
+    s_source = clamp(raw / 100.0)
+    return s_source, {"source_quality": s_source}
+from __future__ import annotations
+from typing import Dict, Any
+from .config import ModelConfig
+from .normalize import clamp
+from .rules import profile_score, engagement_score, source_score
+from .explain import top_signals
+
+
+def weighted_avg(parts):
+    total_w = sum(w for _, w in parts)
+    if total_w <= 0:
+        return 0.0
+    return sum(v * w for v, w in parts) / total_w
+
+
+def qualify(score_0_100: int, cfg: ModelConfig) -> str:
+    if score_0_100 >= cfg.thresholds.high:
+        return "high"
+    if score_0_100 >= cfg.thresholds.medium:
+        return "medium"
+    return "low"
+
+
+def score_one(lead: Dict[str, Any], cfg: ModelConfig) -> Dict[str, Any]:
+    p, p_sig = profile_score(lead)
+    e, e_sig = engagement_score(lead, cfg)
+    s, s_sig = source_score(lead, cfg)
+
+    combined = weighted_avg([
+        (p, cfg.weights.profile),
+        (e, cfg.weights.engagement),
+        (s, cfg.weights.source),
+    ])
+    combined = clamp(combined, 0.0, 1.0)
+
+    score_0_100 = int(round(combined * cfg.max_score))
+    q = qualify(score_0_100, cfg)
+
+    signals = {}
+    signals.update(p_sig)
+    signals.update(e_sig)
+    signals.update(s_sig)
+
+    return {
+        "lead_id": lead.get("lead_id"),
+        "score": score_0_100,
+        "qualification": q,
+        "top_signals": top_signals(signals, k=5),
+        "debug": {
+            "profile": round(p, 3),
+            "engagement": round(e, 3),
+            "source": round(s, 3),
+        },
+    }
+from lead_scoring.config import ModelConfig
+from lead_scoring.scorer import score_one
+
+
+def test_scoring_outputs_fields():
+    cfg = ModelConfig()
+    lead = {
+        "lead_id": "X",
+        "company_size": 200,
+        "title": "VP Sales",
+        "industry_match": True,
+        "site_visits": 10,
+        "email_opens": 3,
+        "email_clicks": 2,
+        "requested_demo": False,
+        "source": "organic",
+    }
+    out = score_one(lead, cfg)
+    assert "score" in out
+    assert 0 <= out["score"] <= 100
+    assert out["qualification"] in {"high", "medium", "low"}
+    assert isinstance(out["top_signals"], list)
